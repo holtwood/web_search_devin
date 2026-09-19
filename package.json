@@ -31,11 +31,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mimimaster/windsurf-search-mcp.git"
+    "url": "git+https://github.com/holtwood/web_search_devin.git"
   },
   "bugs": {
-    "url": "https://github.com/mimimaster/windsurf-search-mcp/issues"
+    "url": "https://github.com/holtwood/web_search_devin/issues"
   },
-  "homepage": "https://github.com/mimimaster/windsurf-search-mcp#readme",
+  "homepage": "https://github.com/holtwood/web_search_devin#readme",
   "main": "./bin/windsurf-search.mjs"
 }
