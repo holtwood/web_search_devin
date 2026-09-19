@@ -21,7 +21,7 @@ npm i -g windsurf-search-mcp
 不装也行，直接跑：
 
 ```bash
-npx -y windsurf-search-mcp --help
+npx -y -p windsurf-search-mcp windsurf-search --help
 ```
 
 ---
@@ -84,7 +84,7 @@ windsurf-search config clear
 
 Token 解析优先级：
 
-1. 命令行参数 `--api-key <token>`
+1. 命令行参数 `--api-key <token>`（方便，但会在 `ps` 和 shell 历史中泄露，真实密钥建议用 2–3）
 2. 环境变量 `WINDSURF_API_KEY`
 3. key 文件（按顺序找第一个存在的）：
    - `~/.config/windsurf-search/api-key`
@@ -171,7 +171,8 @@ windsurf-search "tauri 窗口拖拽区域" --limit 5
 ## 安全提示
 
 - 不要把真实 token 提交到代码仓库。
-- Session token 会过期，搜索返回 401 时重新执行 `config set`。
+- 尽量避免把密钥写进命令行参数（`--api-key`、`--login <email> <password>`、`config set <key>`）：参数会在 `ps` 中可见并落入 shell 历史。优先用环境变量、key 文件或交互式输入。
+- Session token 会过期，搜索返回 401 时重新执行 `config set` 或 `--login`（认证失败时 CLI 会打印过期提示）。
 - `config show` 只会打印脱敏后的 key。
 - 本项目 **不是** Windsurf/Devin 官方产品。
 

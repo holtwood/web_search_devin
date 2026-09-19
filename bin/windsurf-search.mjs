@@ -21,9 +21,16 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { realpathSync } from 'node:fs';
+import { realpathSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+const PACKAGE_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  } catch {
+    return '0.0.0'; // script copied standalone without package.json
+  }
+})();
 const WEB_SEARCH_PATH = '/exa.api_server_pb.ApiServerService/GetWebSearchResults';
 const SERVER_HOSTS = ['server.codeium.com', 'server.self-serve.windsurf.com'];
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -62,7 +69,12 @@ export function buildRequestBody(apiKey, query, { limit = 5, domain = '', mode, 
       locale: 'en',
     },
     query: trimmed,
-    limit: Math.max(1, Math.min(MAX_LIMIT, Number(limit) || 5)),
+    // NaN falls back to the default; every other value clamps into 1-10
+    // (0 -> 1, -3 -> 1, 2.5 -> 2, Infinity -> 10).
+    limit: (() => {
+      const parsed = Math.trunc(Number(limit));
+      return Math.max(1, Math.min(MAX_LIMIT, Number.isNaN(parsed) ? 5 : parsed));
+    })(),
   };
   if (domain) body.domain = String(domain);
   if (mode !== undefined && mode !== null && mode !== '') body.mode = mode;
@@ -114,7 +126,11 @@ async function postJson(fetchFn, host, path, body, { timeoutMs = DEFAULT_TIMEOUT
     });
     if (response.status >= 400) {
       const raw = await response.text();
-      throw new Error(`GetWebSearchResults ${host} -> HTTP ${response.status}: ${raw.slice(0, 200)}`);
+      const error = new Error(
+        `GetWebSearchResults ${host} -> HTTP ${response.status}: ${raw.slice(0, 200)}`,
+      );
+      error.httpStatus = response.status;
+      throw error;
     }
     return await response.json();
   } finally {
@@ -124,23 +140,37 @@ async function postJson(fetchFn, host, path, body, { timeoutMs = DEFAULT_TIMEOUT
 
 /**
  * Run one search against Windsurf's direct web search endpoint.
- * Tries every SERVER_HOSTS in order until one returns 2xx.
+ * Tries every SERVER_HOSTS in order until one returns 2xx. Auth failures
+ * (401/403) are deterministic — short-circuit instead of failing over, and
+ * report every host's error so the root cause is not masked.
  */
 export async function searchWindsurf(apiKey, query, options = {}) {
   const body = buildRequestBody(apiKey, query, options);
   const fetchFn = options.fetchImpl || fetchImpl;
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
   const hosts = options.hosts && options.hosts.length ? options.hosts : SERVER_HOSTS;
-  let lastError = null;
+  const errors = [];
   for (const host of hosts) {
     try {
       const payload = await postJson(fetchFn, host, WEB_SEARCH_PATH, body, { timeoutMs });
+      if (!Array.isArray(payload?.results) && payload && typeof payload === 'object' && payload.error) {
+        throw new Error(
+          `GetWebSearchResults ${host} -> ${JSON.stringify(payload.error).slice(0, 200)}`,
+        );
+      }
       return normalizeHits(payload);
     } catch (error) {
-      lastError = error;
+      errors.push(error);
+      const status = error instanceof Error ? error.httpStatus : undefined;
+      if (status === 401 || status === 403) break;
     }
   }
-  throw lastError || new Error('windsurf-search: all hosts failed');
+  const detail = errors.map((e) => (e instanceof Error ? e.message : String(e))).join(' | ');
+  const authFailed = errors.some((e) => e instanceof Error && (e.httpStatus === 401 || e.httpStatus === 403));
+  const hint = authFailed
+    ? ' — session token likely expired; re-run `windsurf-search config set` or `windsurf-search --login`'
+    : '';
+  throw new Error(`windsurf-search: all hosts failed: ${detail || 'unknown error'}${hint}`);
 }
 
 // ─── key resolution ────────────────────────────────────────────────────
@@ -209,15 +239,21 @@ function buildBrowserFingerprintHeaders() {
  *   2. WindsurfPostAuth（X-Devin-Auth1-Token 头，空 application/proto body）→ sessionToken
  * sessionToken 形如 `devin-session-token$xxx`，直接作为 metadata.apiKey 使用。
  */
-export async function loginWindsurf(email, password, { fetchImpl: fn = fetchImpl } = {}) {
+export async function loginWindsurf(email, password, { fetchImpl: fn = fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const fingerprint = buildBrowserFingerprintHeaders();
 
   // Step 1: Auth1 password/login
   const loginBody = JSON.stringify({ email, password });
   const loginResponse = await fn(AUTH1_PASSWORD_LOGIN_URL, {
     method: 'POST',
-    headers: { ...fingerprint, 'Content-Type': 'application/json', 'Content-Length': loginBody.length },
+    headers: {
+      ...fingerprint,
+      'Content-Type': 'application/json',
+      // byte length, not UTF-16 length — non-ASCII credentials must not truncate
+      'Content-Length': Buffer.byteLength(loginBody),
+    },
     body: loginBody,
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const loginPayload = await loginResponse.json().catch(() => ({}));
   const loginDetail = loginPayload?.detail;
@@ -234,7 +270,7 @@ export async function loginWindsurf(email, password, { fetchImpl: fn = fetchImpl
 
   // Step 2: WindsurfPostAuth → sessionToken（双 host 重试，新路径优先）
   const postAuthUrls = [POST_AUTH_URL_NEW, POST_AUTH_URL_LEGACY];
-  let lastError = null;
+  const errors = [];
   for (const url of postAuthUrls) {
     try {
       const paResponse = await fn(url, {
@@ -248,18 +284,20 @@ export async function loginWindsurf(email, password, { fetchImpl: fn = fetchImpl
           Referer: 'https://windsurf.com/account/login',
         },
         body: '',
+        signal: AbortSignal.timeout(timeoutMs),
       });
       const paText = await paResponse.text().catch(() => '');
       const sessionToken = extractSessionToken(paText);
       if (paResponse.status >= 200 && paResponse.status < 300 && sessionToken) {
         return { apiKey: sessionToken, name: email, email, sessionToken };
       }
-      lastError = new Error(`PostAuth ${new URL(url).host} HTTP ${paResponse.status}: ${paText.slice(0, 160)}`);
+      errors.push(new Error(`PostAuth ${new URL(url).host} HTTP ${paResponse.status}: ${paText.slice(0, 160)}`));
     } catch (error) {
-      lastError = error;
+      errors.push(error);
     }
   }
-  throw lastError || new Error('windsurf-search login: PostAuth failed on all hosts');
+  const detail = errors.map((e) => (e instanceof Error ? e.message : String(e))).join(' | ');
+  throw new Error(`windsurf-search login: PostAuth failed: ${detail || 'unknown error'}`);
 }
 
 /** PostAuth 返回可能是 JSON 或裸 proto 文本，两种都提取 sessionToken。 */
@@ -267,11 +305,15 @@ export function extractSessionToken(payload) {
   const raw = String(payload || '');
   try {
     const parsed = JSON.parse(raw);
-    if (parsed?.sessionToken) return parsed.sessionToken;
+    if (typeof parsed?.sessionToken === 'string' && parsed.sessionToken) {
+      return parsed.sessionToken;
+    }
   } catch {
     // not JSON — fall through to regex
   }
-  return raw.match(/devin-session-token\$[a-zA-Z0-9._-]+/)?.[0] || '';
+  // Token chars: alphanumerics + base64-ish punctuation; stops at whitespace
+  // or structural chars so proto text can't extend the match past the token.
+  return raw.match(/devin-session-token\$[A-Za-z0-9._\-+/=]+/)?.[0] || '';
 }
 
 // ─── config subcommand (set / show / test / clear) ─────────────────────
@@ -310,17 +352,33 @@ export async function readConfiguredKey({ keyFile } = {}) {
   }
 }
 
-/** 把 key 写入 key 文件（自动建目录，chmod 600）。 */
+/** 把 key 写入 key 文件（自动建目录，chmod 600——含已存在的文件）。 */
 export async function saveKey(keyPath, key) {
-  const { writeFile, mkdir } = await import('node:fs/promises');
+  const { writeFile, mkdir, chmod } = await import('node:fs/promises');
   await mkdir(dirname(keyPath), { recursive: true });
   await writeFile(keyPath, `${key.trim()}\n`, { mode: 0o600 });
+  // writeFile's mode only applies to newly created files; tighten an
+  // existing file too so a previously permissive api-key can't stay 644.
+  // Best-effort: chmod fails on non-POSIX filesystems (e.g. 9p/FAT mounts),
+  // where the key is still saved — warn instead of failing the command.
+  try {
+    await chmod(keyPath, 0o600);
+  } catch {
+    process.stderr.write(
+      'windsurf-search: warning: could not chmod 600 the key file (non-POSIX filesystem?)\n',
+    );
+  }
 }
 
 async function runConfigCommand(action, args, { keyFile = defaultKeyFilePath() } = {}) {
   if (action === 'set') {
+    if (args.length > 1) {
+      process.stderr.write('windsurf-search config set: takes a single <key> argument\n');
+      return 2;
+    }
     let key = args[0] || '';
     if (!key) key = await promptLine('Windsurf API key: ', { password: true });
+    if (key === null) return 130; // Ctrl-C cancelled
     if (!key || !key.trim()) {
       process.stderr.write('windsurf-search config set: key is required\n');
       return 2;
@@ -332,26 +390,46 @@ async function runConfigCommand(action, args, { keyFile = defaultKeyFilePath() }
         `format: ${format.label}\n` +
         (format.ok ? '' : 'warning: this key format may not work with GetWebSearchResults\n'),
     );
+    const envVar = ['WINDSURF_API_KEY', 'WINDSURFAPI_CODEIUM_API_KEY'].find((n) => process.env[n]?.trim());
+    if (envVar) {
+      process.stderr.write(`warning: ${envVar} is set and takes precedence — the saved key is shadowed\n`);
+    }
     return 0;
   }
 
   if (action === 'show') {
-    const key = await readConfiguredKey({ keyFile });
+    // Report the key a real search would actually use: env first, then the
+    // first non-empty candidate file — plus any shadowed key files.
+    const envVar = ['WINDSURF_API_KEY', 'WINDSURFAPI_CODEIUM_API_KEY'].find((n) => process.env[n]?.trim());
+    const files = [];
+    for (const filePath of candidateKeyFilePaths()) {
+      const line = await readConfiguredKey({ keyFile: filePath });
+      if (line) files.push({ filePath, key: line });
+    }
+    const found = files[0];
+    const key = envVar ? process.env[envVar].trim() : found?.key || '';
     const format = describeKeyFormat(key);
     process.stdout.write(
-      `config file: ${keyFile}\n` +
-        `key: ${key ? maskKey(key) : '(not configured)'}\n` +
+      `key: ${key ? maskKey(key) : '(not configured)'}\n` +
+        `source: ${envVar ? `env ${envVar}` : found?.filePath || '(none)'}\n` +
         `format: ${format.label}\n` +
-        `status: ${key ? 'configured' : 'missing'}\n`,
+        `status: ${key ? 'configured' : 'missing'}\n` +
+        (envVar && files.length
+          ? `note: key file(s) present but shadowed by ${envVar}: ${files.map((f) => f.filePath).join(', ')}\n`
+          : '') +
+        (!envVar && files.length > 1
+          ? `warning: shadowed key file(s) ignored: ${files.slice(1).map((f) => f.filePath).join(', ')}\n`
+          : ''),
     );
     return key ? 0 : 2;
   }
 
   if (action === 'test') {
-    const query = args[0] || 'windsurf search connectivity test';
+    const query = args.join(' ') || 'windsurf search connectivity test';
     let key;
     try {
-      key = await resolveApiKey({ keyFile });
+      // Resolve exactly like a real search (env + all key-file candidates).
+      key = await resolveApiKey({});
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
       return 1;
@@ -373,15 +451,27 @@ async function runConfigCommand(action, args, { keyFile = defaultKeyFilePath() }
   }
 
   if (action === 'clear') {
+    // Remove every candidate key file — a search resolves across all of them,
+    // so clearing only the default would silently leave a working key behind.
     const { rm } = await import('node:fs/promises');
-    try {
-      await rm(keyFile, { force: true });
-      process.stdout.write(`removed ${keyFile}\n`);
-      return 0;
-    } catch (error) {
-      process.stderr.write(`windsurf-search config clear: ${error instanceof Error ? error.message : String(error)}\n`);
-      return 1;
+    const removed = [];
+    for (const filePath of candidateKeyFilePaths()) {
+      try {
+        await rm(filePath);
+        removed.push(filePath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          process.stderr.write(`windsurf-search config clear: ${error instanceof Error ? error.message : String(error)}\n`);
+          return 1;
+        }
+      }
     }
+    process.stdout.write(removed.length ? `removed ${removed.join('\nremoved ')}\n` : 'no key files found\n');
+    const envVar = ['WINDSURF_API_KEY', 'WINDSURFAPI_CODEIUM_API_KEY'].find((n) => process.env[n]?.trim());
+    if (envVar) {
+      process.stderr.write(`warning: ${envVar} is still set in the environment — searches remain authenticated\n`);
+    }
+    return 0;
   }
 
   process.stderr.write('windsurf-search config: unknown action. use set | show | test | clear\n');
@@ -393,19 +483,31 @@ async function runConfigCommand(action, args, { keyFile = defaultKeyFilePath() }
 function parseArgs(argv) {
   const positionals = [];
   const flags = {};
+  const errors = [];
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (!token) continue;
-    if (token === '--limit' || token === '--domain' || token === '--mode' || token === '--api-key') {
-      flags[token.slice(2)] = argv[index + 1];
-      index += 1;
+    if (token === '--') {
+      positionals.push(...argv.slice(index + 1));
+      break;
+    }
+    if (token === '-h') {
+      flags.help = true;
+    } else if (token === '--limit' || token === '--domain' || token === '--mode' || token === '--api-key') {
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith('--') || value === '-h') {
+        errors.push(`windsurf-search: ${token} requires a value`);
+      } else {
+        flags[token.slice(2)] = value;
+        index += 1;
+      }
     } else if (token.startsWith('--')) {
       flags[token.slice(2)] = true;
     } else {
       positionals.push(token);
     }
   }
-  return { positionals, flags };
+  return { positionals, flags, errors };
 }
 
 function printUsage(stream) {
@@ -413,17 +515,22 @@ function printUsage(stream) {
     'windsurf-search: Windsurf/Devin web search CLI (+ MCP companion)\n' +
       'usage:\n' +
       '  windsurf-search <query> [--limit N] [--domain d] [--mode m] [--api-key k]\n' +
+      '  windsurf-search --help | -h            (show this help)\n' +
+      '  windsurf-search --version              (print version)\n' +
       '  windsurf-search --login                (prompts for email+password, saves key to ~/.config/windsurf-search/api-key)\n' +
       '  windsurf-search --login <email> <password>\n' +
       '  windsurf-search config set <key>       (save a key to ~/.config/windsurf-search/api-key, chmod 600)\n' +
       '  windsurf-search config show            (show saved key status, masked)\n' +
       '  windsurf-search config test [query]    (run a real search to verify the configured key)\n' +
-      '  windsurf-search config clear           (remove the saved key file)\n',
+      '  windsurf-search config clear           (remove the saved key file)\n' +
+      'note: prefer env/key-file/interactive input for secrets — values passed\n' +
+      '  as argv are visible in `ps` and your shell history.\n',
   );
 }
 
 /**
  * 交互式读取一行输入。password=true 时隐藏回显（输出到 stderr，不污染 stdout JSON）。
+ * 返回输入字符串；Ctrl-C 取消时返回 null。
  */
 async function promptLine(promptText, { password = false } = {}) {
   const { createInterface } = await import('node:readline');
@@ -437,9 +544,19 @@ async function promptLine(promptText, { password = false } = {}) {
       if (password && rl.terminal) {
         // 隐藏密码回显：自己渲染提示符，静默读行
         let input = '';
+        let inEscape = false; // 吞掉方向键等 ANSI 转义序列
         const rawOnData = (chunk) => {
           const str = chunk.toString('utf8');
           for (const ch of str) {
+            if (inEscape) {
+              // 'O' 是 SS3 序列的中间字符（如 \x1bOA 方向键），不是终止符
+              if (ch !== 'O' && /[a-zA-Z~]/.test(ch)) inEscape = false;
+              continue;
+            }
+            if (ch.charCodeAt(0) === 0x1b) {
+              inEscape = true;
+              continue;
+            }
             if (ch === '\n' || ch === '\r') {
               process.stderr.write('\n');
               resolve(input);
@@ -449,17 +566,18 @@ async function promptLine(promptText, { password = false } = {}) {
             if (ch === '\u0003') {
               // Ctrl-C
               process.stderr.write('^C\n');
-              resolve('');
+              resolve(null);
               cleanup();
               return;
             }
             if (ch === '\u007f' || ch === '\b') {
-              input = input.slice(0, -1);
+              input = Array.from(input).slice(0, -1).join('');
               process.stderr.write('\b \b');
-            } else {
-              input += ch;
-              process.stderr.write('*');
+              continue;
             }
+            if (ch < ' ') continue; // 丢弃其余控制字符
+            input += ch;
+            process.stderr.write('*');
           }
         };
         const cleanup = () => {
@@ -482,13 +600,31 @@ async function promptLine(promptText, { password = false } = {}) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { positionals, flags } = parseArgs(argv);
+  const { positionals, flags, errors } = parseArgs(argv);
+
+  if (flags.help) {
+    printUsage(process.stdout);
+    return 0;
+  }
+  if (flags.version) {
+    process.stdout.write(`windsurf-search ${PACKAGE_VERSION}\n`);
+    return 0;
+  }
+  if (errors.length > 0) {
+    process.stderr.write(`${errors.join('\n')}\n`);
+    return 2;
+  }
 
   if (flags.login) {
+    if (positionals.length > 2) {
+      process.stderr.write('windsurf-search login: --login takes at most <email> <password>\n');
+      return 2;
+    }
     let email = positionals[0] || '';
     let password = positionals[1] || '';
     if (!email) email = await promptLine('Windsurf email: ');
     if (!password) password = await promptLine('Windsurf password: ', { password: true });
+    if (email === null || password === null) return 130; // Ctrl-C cancelled
     if (!email || !password) {
       process.stderr.write('windsurf-search login: email and password are required\n');
       return 2;
@@ -496,15 +632,14 @@ export async function main(argv = process.argv.slice(2)) {
     try {
       const result = await loginWindsurf(email, password);
       const keyPath = defaultKeyFilePath();
-      const { writeFile, mkdir } = await import('node:fs/promises');
-      await mkdir(dirname(keyPath), { recursive: true });
-      await writeFile(keyPath, `${result.apiKey}\n`, { mode: 0o600 });
+      await saveKey(keyPath, result.apiKey);
       process.stderr.write(
-        `windsurf-search login: OK for ${result.email} — apiKey saved to ${keyPath} (chmod 600)\n`,
+        `windsurf-search login: OK for ${result.email} — apiKey saved to ${keyPath}\n`,
       );
       return 0;
     } catch (error) {
-      process.stderr.write(`windsurf-search login: ${error instanceof Error ? error.message : String(error)}\n`);
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`${message.startsWith('windsurf-search') ? message : `windsurf-search login: ${message}`}\n`);
       return 1;
     }
   }
@@ -525,16 +660,20 @@ export async function main(argv = process.argv.slice(2)) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
-  const limit = Number(flags.limit) > 0 ? Number(flags.limit) : 5;
-  const options = { limit };
+  const options = {};
+  if (flags.limit !== undefined) options.limit = flags.limit;
   if (flags.domain) options.domain = String(flags.domain);
-  if (flags.mode) options.mode = Number(flags.mode) || String(flags.mode);
+  if (flags.mode !== undefined) {
+    const numeric = Number(flags.mode);
+    options.mode = Number.isFinite(numeric) ? numeric : String(flags.mode);
+  }
   try {
     const hits = await searchWindsurf(apiKey, query, options);
     process.stdout.write(`${JSON.stringify({ hits })}\n`);
     return 0;
   } catch (error) {
-    process.stderr.write(`windsurf-search: ${error instanceof Error ? error.message : String(error)}\n`);
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message.startsWith('windsurf-search') ? message : `windsurf-search: ${message}`}\n`);
     return 1;
   }
 }

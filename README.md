@@ -21,7 +21,7 @@ npx -y -p windsurf-search-mcp windsurf-search --help
 
 Resolve order:
 
-1. `--api-key <token>`
+1. `--api-key <token>` — convenient but visible in `ps` and shell history; prefer 2–3 for real secrets
 2. `WINDSURF_API_KEY` (or legacy `WINDSURFAPI_CODEIUM_API_KEY`)
 3. first existing key file:
    - `~/.config/windsurf-search/api-key`
@@ -118,7 +118,11 @@ RUN_LIVE_SEARCH=1 npm test      # also hit live API if key is configured
 ## Security notes
 
 - Never commit real tokens.
-- Session tokens expire; re-run `config set` when searches return 401.
+- Avoid passing secrets as argv (`--api-key`, `--login <email> <password>`,
+  `config set <key>`): they are visible in `ps` and land in shell history.
+  Prefer `WINDSURF_API_KEY`, the key file, or the interactive prompts.
+- Session tokens expire; re-run `config set` or `--login` when searches
+  return 401 (the CLI prints an expiry hint on auth failures).
 - `config show` only prints a masked key.
 - This is **not** an official Windsurf/Devin product.
 

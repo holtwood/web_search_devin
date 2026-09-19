@@ -16,6 +16,7 @@ import {
   describeKeyFormat,
   readConfiguredKey,
   saveKey,
+  main,
   __setWindsurfSearchFetchForTest,
 } from '../bin/windsurf-search.mjs';
 
@@ -320,4 +321,191 @@ test('saveKey and readConfiguredKey round-trip through config set semantics', as
   await saveKey(keyFile, 'devin-session-token$round-trip');
   assert.equal(await readConfiguredKey({ keyFile }), 'devin-session-token$round-trip');
   await rm(dir, { recursive: true, force: true });
+});
+
+test('extractSessionToken ignores non-string sessionToken fields', () => {
+  assert.equal(extractSessionToken('{"sessionToken":12345}'), '');
+  assert.equal(extractSessionToken('{"sessionToken":{"x":1}}'), '');
+});
+
+test('saveKey tightens permissions on a pre-existing 644 key file', { skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'windsurf-search-chmod-'));
+  const keyFile = join(dir, 'api-key');
+  await writeFile(keyFile, 'old\n', { mode: 0o644 });
+  await saveKey(keyFile, 'devin-session-token$x');
+  const { stat } = await import('node:fs/promises');
+  assert.equal((await stat(keyFile)).mode & 0o777, 0o600);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('searchWindsurf short-circuits on 401 and surfaces the auth failure', async () => {
+  const calls = [];
+  __setWindsurfSearchFetchForTest(async (url) => {
+    calls.push(url);
+    return { status: 401, text: async () => 'unauthorized' };
+  });
+  await assert.rejects(
+    () => searchWindsurf('key', 'q', { hosts: ['a.com', 'b.com'] }),
+    /HTTP 401.*session token likely expired/s,
+  );
+  assert.equal(calls.length, 1);
+});
+
+test('searchWindsurf aggregates errors from every host', async () => {
+  __setWindsurfSearchFetchForTest(async (url) => {
+    if (url.includes('a.com')) return { status: 500, text: async () => 'a-broken' };
+    return { status: 500, text: async () => 'b-broken' };
+  });
+  await assert.rejects(
+    () => searchWindsurf('key', 'q', { hosts: ['a.com', 'b.com'] }),
+    /a-broken.*b-broken/s,
+  );
+});
+
+test('searchWindsurf throws on a 200 payload carrying an error object', async () => {
+  __setWindsurfSearchFetchForTest(async () => ({
+    status: 200,
+    json: async () => ({ error: { code: 'quota_exceeded' } }),
+  }));
+  await assert.rejects(
+    () => searchWindsurf('key', 'q', { hosts: ['a.com'] }),
+    /quota_exceeded/,
+  );
+});
+
+test('main sends numeric --mode 0 and clamps --limit -3 to 1', async () => {
+  const bodies = [];
+  __setWindsurfSearchFetchForTest(async (url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return { status: 200, json: async () => ({ results: [] }) };
+  });
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    await main(['q', '--mode', '0', '--api-key', 'k']);
+    await main(['q', '--limit', '-3', '--api-key', 'k']);
+  } finally {
+    process.stdout.write = origWrite;
+  }
+  assert.equal(bodies[0].mode, 0);
+  assert.equal(bodies[1].limit, 1);
+});
+
+test('main reports missing flag values as usage errors', async () => {
+  const origErr = process.stderr.write.bind(process.stderr);
+  const seen = [];
+  process.stderr.write = (chunk) => {
+    seen.push(String(chunk));
+    return true;
+  };
+  try {
+    assert.equal(await main(['q', '--api-key']), 2);
+    assert.equal(await main(['--domain', '--limit', '3', 'q']), 2);
+  } finally {
+    process.stderr.write = origErr;
+  }
+  assert.match(seen.join(''), /requires a value/);
+});
+
+test('main --help, -h and --version exit 0', async () => {
+  const origOut = process.stdout.write.bind(process.stdout);
+  const seen = [];
+  process.stdout.write = (chunk) => {
+    seen.push(String(chunk));
+    return true;
+  };
+  try {
+    assert.equal(await main(['--help']), 0);
+    assert.equal(await main(['-h']), 0);
+    assert.equal(await main(['--version']), 0);
+  } finally {
+    process.stdout.write = origOut;
+  }
+  const text = seen.join('');
+  assert.match(text, /usage:/);
+  assert.match(text, /windsurf-search \d+\.\d+\.\d+/);
+});
+
+test('loginWindsurf sends byte-accurate Content-Length for non-ASCII credentials', async () => {
+  let seen;
+  __setWindsurfSearchFetchForTest(async (url, init) => {
+    if (url.includes('_devin-auth/password/login')) {
+      seen = init;
+      return { ok: true, status: 200, json: async () => ({ token: 'auth1-t' }) };
+    }
+    return { ok: true, status: 200, text: async () => 'devin-session-token$x' };
+  });
+  await loginWindsurf('a@b.com', '密码 secret');
+  const expected = Buffer.byteLength(
+    JSON.stringify({ email: 'a@b.com', password: '密码 secret' }),
+  );
+  assert.equal(seen.headers['Content-Length'], expected);
+});
+
+test('buildRequestBody clamps limit 0 up to 1 like negatives', () => {
+  assert.equal(buildRequestBody('k', 'q', { limit: 0 }).limit, 1);
+  assert.equal(buildRequestBody('k', 'q', { limit: -3 }).limit, 1);
+  assert.equal(buildRequestBody('k', 'q', { limit: 2.7 }).limit, 2);
+  assert.equal(buildRequestBody('k', 'q', { limit: 'abc' }).limit, 5);
+});
+
+// HOME patching only steers os.homedir() on POSIX; on Windows homedir() uses
+// USERPROFILE, so these tests would touch the real user profile — skip.
+test('config clear removes every candidate key file', { skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'windsurf-cfg-'));
+  const oldHome = process.env.HOME;
+  process.env.HOME = dir;
+  const origOut = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    const fs = await import('node:fs/promises');
+    const p1 = join(dir, '.config', 'windsurf-search');
+    const p2 = join(dir, '.windsurf-search');
+    const p3 = join(dir, '.piwin');
+    await fs.mkdir(p1, { recursive: true });
+    await fs.mkdir(p2, { recursive: true });
+    await fs.mkdir(p3, { recursive: true });
+    await fs.writeFile(join(p1, 'api-key'), 'k1\n');
+    await fs.writeFile(join(p2, 'api-key'), 'k2\n');
+    await fs.writeFile(join(p3, 'windsurf-api-key'), 'k3\n');
+    assert.equal(await main(['config', 'clear']), 0);
+    const gone = async (p) => fs.readFile(p, 'utf8').then(() => false).catch(() => true);
+    assert.ok(await gone(join(p1, 'api-key')), 'default candidate still present');
+    assert.ok(await gone(join(p2, 'api-key')), 'candidate 2 still present');
+    assert.ok(await gone(join(p3, 'windsurf-api-key')), 'candidate 3 still present');
+  } finally {
+    process.env.HOME = oldHome;
+    process.stdout.write = origOut;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('config show reports the effective source and shadowed files', { skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'windsurf-cfg-'));
+  const oldHome = process.env.HOME;
+  process.env.HOME = dir;
+  const seen = [];
+  const origOut = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => {
+    seen.push(String(chunk));
+    return true;
+  };
+  try {
+    const fs = await import('node:fs/promises');
+    const p1 = join(dir, '.config', 'windsurf-search');
+    const p2 = join(dir, '.windsurf-search');
+    await fs.mkdir(p1, { recursive: true });
+    await fs.mkdir(p2, { recursive: true });
+    await fs.writeFile(join(p1, 'api-key'), 'devin-session-token$primary\n');
+    await fs.writeFile(join(p2, 'api-key'), 'devin-session-token$shadow\n');
+    assert.equal(await main(['config', 'show']), 0);
+    const text = seen.join('');
+    assert.match(text, new RegExp(`source: ${p1.replace(/[/\\]/g, '.')}`));
+    assert.match(text, /shadowed key file/);
+    assert.match(text, /api-key/);
+  } finally {
+    process.env.HOME = oldHome;
+    process.stdout.write = origOut;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

@@ -1,6 +1,6 @@
 {
   "name": "windsurf-search-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server + CLI for Windsurf/Devin server-side web search (GetWebSearchResults)",
   "type": "module",
   "license": "MIT",
@@ -14,6 +14,7 @@
   "files": [
     "bin",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "scripts": {
@@ -36,5 +37,5 @@
     "url": "https://github.com/mimimaster/windsurf-search-mcp/issues"
   },
   "homepage": "https://github.com/mimimaster/windsurf-search-mcp#readme",
-  "main": "./bin/windsurf-search-mcp.mjs"
+  "main": "./bin/windsurf-search.mjs"
 }
